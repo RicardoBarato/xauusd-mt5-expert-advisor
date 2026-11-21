@@ -11,7 +11,8 @@ Validation is a process, not a single backtest.
 - Gold/XAUUSD can gap or reprice abruptly.
 - Parameter choices can be overfit.
 - Low trade count can make results statistically fragile.
-- Thresholds expressed in points (`MinATR_points`, `MinSL_points`, `SpreadMax_points`) are absolute dollar distances and do not scale with gold's price level, so a parameter set validated at one price level behaves differently at another.
+- Thresholds expressed in points (`MinATR_points`, `MinSL_points`, `SpreadMax_points`) are absolute dollar distances and do not scale with gold's price level, so a parameter set validated at one price level behaves differently at another. EA 1.02 offers `threshold_mode = 1` as a volatility-relative alternative.
+- A stack of many gates can make a strategy trade so rarely that no statistic about it is meaningful. Find which gate rejects most candidate bars before tuning any single one.
 - Results that depend on the evaluation model (every tick versus bar close) are evidence of execution sensitivity, not of an edge.
 
 ## Recommended Additional Tests

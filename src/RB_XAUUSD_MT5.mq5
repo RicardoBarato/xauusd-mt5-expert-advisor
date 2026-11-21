@@ -5,7 +5,7 @@
 //|  Review, test and compile locally in MetaEditor before any use.   |
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.01"
+#property version "1.02"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -165,6 +165,15 @@ input bool macro_require_price_above_fast = false;
 input int macro_slope_bars = 5;
 input double macro_min_slope_ATR = 0.0;
 
+// VOLATILITY-RELATIVE THRESHOLDS AND SIGNAL TIMING (1.02, opt-in)
+// threshold_mode 0 keeps the legacy point thresholds (MinATR_points, MinSL_points, SpreadMax_points).
+// threshold_mode 1 replaces them with values that scale with price and volatility.
+input int    threshold_mode = 0;           // 0 = legacy points | 1 = ATR/price-relative
+input double MinATR_pct_price = 0.0004;    // mode 1: minimum M1 ATR as a fraction of price
+input double MinSL_ATR = 0.70;             // mode 1: minimum stop distance in M1 ATR
+input double SpreadMax_ATR = 0.30;         // mode 1: maximum spread as a fraction of M1 ATR
+input bool   signal_on_closed_bar = false; // evaluate the impulse bar on the last closed M1 bar, once per bar
+
 //==================== STATE ====================//
 double daily_loss_R=0.0;
 int trades_today=0;
@@ -187,6 +196,10 @@ datetime pending_retest_expire=0;
 double pending_retest_level=0.0;
 double pending_retest_sl_ref=0.0;
 double pending_retest_atr_points=0.0;
+
+datetime last_signal_bar_time=0;
+ulong cached_risk_ticket=0;
+double cached_initial_risk_points=0.0;
 
 // handles
 int atr_m1_handle=INVALID_HANDLE;
@@ -257,20 +270,146 @@ double NormalizeLots(double lots)
    return lots;
 }
 
+// Money lost by 1.00 lot over sl_points. OrderCalcProfit is the broker's own calculation
+// and is more reliable than SYMBOL_TRADE_TICK_VALUE on metals; tick value is the fallback.
+double LossPerLot(double sl_points)
+{
+   double price=SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double loss=0.0;
+   if(price>0.0 && OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, price-sl_points*_Point, loss) && loss<0.0)
+      return -loss;
+   double vpp=GetValuePerPoint();
+   return (vpp>0.0) ? sl_points*vpp : 0.0;
+}
+
+// Risk-based volume. NormalizeLots rounds DOWN and returns 0 below the minimum lot,
+// so a trade whose minimum lot would exceed the risk budget is skipped, never up-sized.
 double CalcLots(double sl_points, double risk_pct)
 {
    if(sl_points<=0.0) return 0.0;
    double equity=AccountInfoDouble(ACCOUNT_EQUITY);
    double risk_money=equity*risk_pct;
-   double vpp=GetValuePerPoint();
-   if(vpp<=0.0) return 0.0;
-   return NormalizeLots(risk_money/(sl_points*vpp));
+   double loss_per_lot=LossPerLot(sl_points);
+   if(loss_per_lot<=0.0) return 0.0;
+   return NormalizeLots(risk_money/loss_per_lot);
+}
+
+double CurrentSpreadPoints()
+{
+   return (SymbolInfoDouble(_Symbol,SYMBOL_ASK)-SymbolInfoDouble(_Symbol,SYMBOL_BID))/_Point;
 }
 
 bool SpreadOK()
 {
-   double spread_points=(SymbolInfoDouble(_Symbol,SYMBOL_ASK)-SymbolInfoDouble(_Symbol,SYMBOL_BID))/_Point;
-   return (spread_points<=SpreadMax_points);
+   return (CurrentSpreadPoints()<=SpreadMax_points);
+}
+
+double MinSLPoints(double atr_points)
+{
+   if(threshold_mode==1)
+      return MinSL_ATR*atr_points;
+   return (double)MinSL_points;
+}
+
+// Selects this EA's position on this symbol (symbol + magic), so other robots on the
+// same symbol, or a hedging account, are never touched. Leaves the position selected.
+bool SelectOurPosition()
+{
+   for(int i=PositionsTotal()-1; i>=0; i--)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(ticket==0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber)
+         continue;
+      return true;
+   }
+   return false;
+}
+
+// Risk of the position measured from its ORIGINAL stop (the stop of the opening order),
+// so break-even does not make R collapse and trailing still works afterwards.
+// Must be called with the position selected. Cached per ticket.
+double InitialRiskPoints(ulong ticket, long type, double open_price, double current_sl)
+{
+   if(ticket==cached_risk_ticket && cached_initial_risk_points>0.0)
+      return cached_initial_risk_points;
+
+   double initial_sl=0.0;
+   long position_id=PositionGetInteger(POSITION_IDENTIFIER);
+   if(HistorySelectByPosition(position_id))
+   {
+      int orders=HistoryOrdersTotal();
+      for(int i=0; i<orders; i++)
+      {
+         ulong order_ticket=HistoryOrderGetTicket(i);
+         if(order_ticket==0)
+            continue;
+         double order_sl=HistoryOrderGetDouble(order_ticket, ORDER_SL);
+         if(order_sl>0.0)
+         {
+            initial_sl=order_sl;
+            break;
+         }
+      }
+   }
+   if(initial_sl<=0.0)
+      initial_sl=current_sl;
+
+   double risk=(type==POSITION_TYPE_BUY) ? (open_price-initial_sl)/_Point : (initial_sl-open_price)/_Point;
+   cached_risk_ticket=ticket;
+   cached_initial_risk_points=risk;
+   return risk;
+}
+
+bool IsOurDeal(ulong deal)
+{
+   return HistoryDealGetString(deal, DEAL_SYMBOL)==_Symbol &&
+          HistoryDealGetInteger(deal, DEAL_MAGIC)==InpMagicNumber;
+}
+
+// Rebuilds today's counters from deal history so a terminal restart or EA reload
+// does not reset the trade cap, the daily loss limit or the stop-loss cooldown.
+void RebuildDailyStateFromHistory()
+{
+   datetime now=TimeCurrent();
+   if(!HistorySelect(now-3*86400, now+60))
+      return;
+
+   int deals=HistoryDealsTotal();
+   for(int i=0; i<deals; i++)
+   {
+      ulong deal=HistoryDealGetTicket(i);
+      if(deal==0 || !IsOurDeal(deal))
+         continue;
+
+      datetime deal_time=(datetime)HistoryDealGetInteger(deal, DEAL_TIME);
+      if(GetSessionDayKey(deal_time)!=session_day_key)
+         continue;
+
+      long entry=HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entry==DEAL_ENTRY_IN)
+      {
+         trades_today++;
+         continue;
+      }
+
+      long reason=HistoryDealGetInteger(deal, DEAL_REASON);
+      double deal_pnl=HistoryDealGetDouble(deal, DEAL_PROFIT) +
+                      HistoryDealGetDouble(deal, DEAL_SWAP) +
+                      HistoryDealGetDouble(deal, DEAL_COMMISSION);
+      if(reason==DEAL_REASON_SL && deal_pnl<0.0)
+      {
+         daily_loss_R -= 1.0;
+         if(deal_time>last_sl_time)
+            last_sl_time=deal_time;
+      }
+   }
+
+   if(daily_loss_R <= -max_daily_loss_R)
+      locked_today=true;
 }
 
 bool InWindow(int h,int start,int end_exclusive)
@@ -480,9 +619,9 @@ bool HandleEquityDdHardStop()
    if(dd_pct < equity_dd_hard_stop_pct)
       return false;
 
-   bool has_position=PositionSelect(_Symbol);
+   bool has_position=SelectOurPosition();
    if(has_position && CanSendOrders())
-      trade.PositionClose(_Symbol);
+      trade.PositionClose((ulong)PositionGetInteger(POSITION_TICKET));
 
    if(has_position || equity_dd_hard_stop_block_new_entries || equity_dd_hard_stop_lock_forever)
       locked_today=true;
@@ -629,9 +768,9 @@ bool TryRetestEntry(double risk_pct,
       double sl_retest=pending_retest_level - retest_sl_ATR*atr_points*_Point;
       double sl_price=MathMax(sl_struct, sl_retest);
       double sl_points=(ask-sl_price)/_Point;
-      if(sl_points < MinSL_points)
+      if(sl_points < MinSLPoints(atr_points))
       {
-         sl_points=MinSL_points;
+         sl_points=MinSLPoints(atr_points);
          sl_price=ask-sl_points*_Point;
       }
 
@@ -671,9 +810,9 @@ bool TryRetestEntry(double risk_pct,
    double sl_retest=pending_retest_level + retest_sl_ATR*atr_points*_Point;
    double sl_price=MathMin(sl_struct, sl_retest);
    double sl_points=(sl_price-bid)/_Point;
-   if(sl_points < MinSL_points)
+   if(sl_points < MinSLPoints(atr_points))
    {
-      sl_points=MinSL_points;
+      sl_points=MinSLPoints(atr_points);
       sl_price=bid+sl_points*_Point;
    }
 
@@ -700,9 +839,10 @@ void ManageOpenPosition()
       return;
    if(!CanSendOrders())
       return;
-   if(!PositionSelect(_Symbol))
+   if(!SelectOurPosition())
       return;
 
+   ulong ticket=(ulong)PositionGetInteger(POSITION_TICKET);
    long type=PositionGetInteger(POSITION_TYPE);
    double open_price=PositionGetDouble(POSITION_PRICE_OPEN);
    double sl=PositionGetDouble(POSITION_SL);
@@ -713,7 +853,9 @@ void ManageOpenPosition()
    double bid=SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask=SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double price=(type==POSITION_TYPE_BUY) ? bid : ask;
-   double risk_points=(type==POSITION_TYPE_BUY) ? ((open_price-sl)/_Point) : ((sl-open_price)/_Point);
+   // R is measured from the original stop. Measuring it from the current stop made R
+   // negative after break-even, which silently disabled the ATR trailing (fixed in 1.02).
+   double risk_points=InitialRiskPoints(ticket, type, open_price, sl);
    double profit_points=(type==POSITION_TYPE_BUY) ? ((price-open_price)/_Point) : ((open_price-price)/_Point);
    if(risk_points<=0.0 || profit_points<=0.0)
       return;
@@ -754,7 +896,7 @@ void ManageOpenPosition()
    if(type==POSITION_TYPE_SELL && new_sl <= ask+min_stop_points*_Point)
       return;
 
-   trade.PositionModify(_Symbol, new_sl, tp);
+   trade.PositionModify(ticket, new_sl, tp);
 }
 
 // Squeeze computations
@@ -840,14 +982,14 @@ bool SqueezeGateOK()
 }
 
 // Vol expansion trigger
-bool ATRAccelerationOK()
+bool ATRAccelerationOK(int shift)
 {
    if(!use_atr_accel) return true;
    int need=MathMax(atr_accel_sma_len,2);
    double buf[];
    ArrayResize(buf,need);
-   ArraySetAsSeries(buf,true);   // buf[0] = current bar (without this, buf[0] is the oldest copied value)
-   if(CopyBuffer(atr_m1_handle,0,0,need,buf)!=need) return false;
+   ArraySetAsSeries(buf,true);   // buf[0] = signal bar (without this, buf[0] is the oldest copied value)
+   if(CopyBuffer(atr_m1_handle,0,shift,need,buf)!=need) return false;
    double atr_now=buf[0];
    double sum=0.0;
    for(int i=0;i<atr_accel_sma_len && i<need;i++) sum+=buf[i];
@@ -856,19 +998,19 @@ bool ATRAccelerationOK()
    return (atr_now >= atr_avg*exp_ratio_min);
 }
 
-bool RangeExpansionOK(double atr_points)
+bool RangeExpansionOK(double atr_points, int shift)
 {
    if(!use_range_expansion) return true;
-   double high0=iHigh(_Symbol, PERIOD_M1, 0);
-   double low0 =iLow(_Symbol,  PERIOD_M1, 0);
+   double high0=iHigh(_Symbol, PERIOD_M1, shift);
+   double low0 =iLow(_Symbol,  PERIOD_M1, shift);
    double range_points=(high0-low0)/_Point;
    return (range_points >= range_exp_mult*atr_points);
 }
 
-bool VolExpansionTriggerOK(double atr_points)
+bool VolExpansionTriggerOK(double atr_points, int shift)
 {
-   bool a=ATRAccelerationOK();
-   bool b=RangeExpansionOK(atr_points);
+   bool a=ATRAccelerationOK(shift);
+   bool b=RangeExpansionOK(atr_points, shift);
 
    if(use_atr_accel && use_range_expansion) return (a || b);
    if(use_atr_accel) return a;
@@ -949,6 +1091,7 @@ int OnInit()
 
    trade.SetDeviationInPoints(SlippageMax_points);
    session_day_key = GetSessionDayKey(TimeCurrent());
+   RebuildDailyStateFromHistory();
    equity_peak=AccountInfoDouble(ACCOUNT_EQUITY);
    ClearRetest();
    return INIT_SUCCEEDED;
@@ -965,10 +1108,21 @@ void OnTick()
    if(HandleEquityDdHardStop())
       return;
 
-   if(PositionSelect(_Symbol))
+   if(SelectOurPosition())
    {
       ManageOpenPosition();
       return;
+   }
+
+   // Closed-bar mode: evaluate the signal once per M1 bar, on the bar that just closed.
+   // This removes the dependence on where inside the forming bar a tick lands, so
+   // "every tick" and "OHLC" tester modes (and the Pine port) see the same signals.
+   int sig_shift = signal_on_closed_bar ? 1 : 0;
+   if(signal_on_closed_bar)
+   {
+      datetime bar_time=iTime(_Symbol, PERIOD_M1, 0);
+      if(bar_time==0 || bar_time==last_signal_bar_time) return;
+      last_signal_bar_time=bar_time;
    }
 
    if(last_sl_time>0 && (TimeCurrent()-last_sl_time) < cooldown_minutes_after_sl*60) return;
@@ -977,7 +1131,7 @@ void OnTick()
 
    if(locked_today) return;
    if(trades_today >= max_trades_day) return;
-   if(!SpreadOK()) return;
+   if(threshold_mode==0 && !SpreadOK()) return;
 
    double vol_ratio=1.0;
    if(!GetVolRatio(vol_ratio)) return;
@@ -1013,22 +1167,30 @@ void OnTick()
    if(!bias_up && !bias_dn) return;
 
    double atr_buf[1];
-   if(CopyBuffer(atr_m1_handle,0,0,1,atr_buf)!=1) return;
+   if(CopyBuffer(atr_m1_handle,0,sig_shift,1,atr_buf)!=1) return;
    double atr_points=atr_buf[0]/_Point;
-   if(atr_points < MinATR_points) return;
+   if(threshold_mode==1)
+   {
+      double ref_price=SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(ref_price<=0.0) return;
+      if(atr_buf[0] < MinATR_pct_price*ref_price) return;
+      if(CurrentSpreadPoints() > SpreadMax_ATR*atr_points) return;
+   }
+   else if(atr_points < MinATR_points) return;
+   double min_sl_points=MinSLPoints(atr_points);
 
-   if(!VolExpansionTriggerOK(atr_points)) return;
+   if(!VolExpansionTriggerOK(atr_points, sig_shift)) return;
 
    double adx_buf[1];
-   if(CopyBuffer(adx_m1_handle,0,0,1,adx_buf)!=1) return;
+   if(CopyBuffer(adx_m1_handle,0,sig_shift,1,adx_buf)!=1) return;
    if(adx_buf[0] < active_adx_min) return;
 
    double HH15=0.0, LL15=0.0;
    if(!GetM15StructureLevels(HH15,LL15)) return;
 
-   double high0=iHigh(_Symbol, PERIOD_M1, 0);
-   double low0 =iLow(_Symbol,  PERIOD_M1, 0);
-   double close0=iClose(_Symbol, PERIOD_M1, 0);
+   double high0=iHigh(_Symbol, PERIOD_M1, sig_shift);
+   double low0 =iLow(_Symbol,  PERIOD_M1, sig_shift);
+   double close0=iClose(_Symbol, PERIOD_M1, sig_shift);
 
    double range_points=(high0-low0)/_Point;
    if(range_points < active_impulse_mult*atr_points) return;
@@ -1043,9 +1205,13 @@ void OnTick()
                      high0, low0, close0, close_pos))
       return;
 
-   if(allow_buy && bias_up && bid>HH15 && close_pos>=active_close_pos_min)
+   // Breakout reference: live bid in tick mode, the closed bar's close in closed-bar mode.
+   double long_ref = signal_on_closed_bar ? close0 : bid;
+   double short_ref = signal_on_closed_bar ? close0 : ask;
+
+   if(allow_buy && bias_up && long_ref>HH15 && close_pos>=active_close_pos_min)
    {
-      double extension_points=(bid-HH15)/_Point;
+      double extension_points=(long_ref-HH15)/_Point;
       if(use_retest_entry && !allow_direct_breakout_when_retest)
       {
          ArmRetest(true, HH15, LL15, atr_points);
@@ -1060,7 +1226,7 @@ void OnTick()
 
       double sl_price = LL15 - buffer_points*_Point;
       double sl_points = (ask - sl_price)/_Point;
-      if(sl_points < MinSL_points) sl_points = MinSL_points;
+      if(sl_points < min_sl_points) sl_points = min_sl_points;
 
       double lots=CalcLots(sl_points, risk_pct);
       if(lots<=0.0) return;
@@ -1077,9 +1243,9 @@ void OnTick()
       return;
    }
 
-   if(allow_sell && bias_dn && ask<LL15 && close_pos <= (1.0-active_close_pos_min))
+   if(allow_sell && bias_dn && short_ref<LL15 && close_pos <= (1.0-active_close_pos_min))
    {
-      double extension_points=(LL15-ask)/_Point;
+      double extension_points=(LL15-short_ref)/_Point;
       if(use_retest_entry && !allow_direct_breakout_when_retest)
       {
          ArmRetest(false, LL15, HH15, atr_points);
@@ -1094,7 +1260,7 @@ void OnTick()
 
       double sl_price = HH15 + buffer_points*_Point;
       double sl_points = (sl_price - bid)/_Point;
-      if(sl_points < MinSL_points) sl_points = MinSL_points;
+      if(sl_points < min_sl_points) sl_points = min_sl_points;
 
       double lots=CalcLots(sl_points, risk_pct);
       if(lots<=0.0) return;
@@ -1122,6 +1288,8 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 
    datetime now=TimeCurrent();
    HistorySelect(now-86400, now+60);
+
+   if(!HistoryDealSelect(trans.deal) || !IsOurDeal(trans.deal)) return;
 
    long reason=(long)HistoryDealGetInteger(trans.deal, DEAL_REASON);
    double deal_pnl=HistoryDealGetDouble(trans.deal, DEAL_PROFIT) +

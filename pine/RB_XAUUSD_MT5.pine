@@ -152,6 +152,13 @@ macro_require_price_above_fast = input.bool(false, "macro_require_price_above_fa
 macro_slope_bars               = input.int(5, "macro_slope_bars", minval = 0, group = G_MAC)
 macro_min_slope_ATR            = input.float(0.0, "macro_min_slope_ATR", step = 0.05, group = G_MAC)
 
+G_V102 = "Volatility-relative thresholds (EA 1.02, opt-in)"
+threshold_mode   = input.int(0, "threshold_mode (0 = legacy points | 1 = ATR/price-relative)", minval = 0, maxval = 1, group = G_V102)
+MinATR_pct_price = input.float(0.0004, "MinATR_pct_price (mode 1)", step = 0.0001, group = G_V102)
+MinSL_ATR        = input.float(0.70, "MinSL_ATR (mode 1)", step = 0.05, group = G_V102)
+// SpreadMax_ATR has no effect here: TradingView has no spread series.
+// The Pine port always evaluates closed bars, which is what signal_on_closed_bar = true does in the EA.
+
 // ==================== CHART GUARD ====================
 if barstate.isfirst and timeframe.in_seconds() != 60
     runtime.error("RB_XAUUSD_MT5 port: attach this strategy to a 1-minute chart (the EA runs its signal logic on M1).")
@@ -352,6 +359,7 @@ var float pending_retest_atr_points = 0.0
 
 var float pos_sl = na
 var float pos_tp = na
+var float pos_init_risk = na   // R distance of the original stop, in points
 var int closed_seen = 0
 
 // ==================== OnTradeTransaction: stop-loss accounting ====================
@@ -407,7 +415,10 @@ if go and in_position
         bool is_buy = strategy.position_size > 0
         float open_price = strategy.position_avg_price
         float price = is_buy ? bid_px : ask_px
-        float risk_points = (is_buy ? (open_price - pos_sl) : (pos_sl - open_price)) / point_size
+        // R from the ORIGINAL stop (EA 1.02 fix): measuring from the current stop disabled trailing after break-even.
+        if na(pos_init_risk)
+            pos_init_risk := (is_buy ? (open_price - pos_sl) : (pos_sl - open_price)) / point_size
+        float risk_points = pos_init_risk
         float profit_points = (is_buy ? (price - open_price) : (open_price - price)) / point_size
         if risk_points > 0 and profit_points > 0
             float new_sl = pos_sl
@@ -568,8 +579,13 @@ if go
 
 // ATR M1 floor
 float atr_points = atr_m1 / point_size
-if go and (na(atr_m1) or atr_points < MinATR_points)
+if go and na(atr_m1)
     go := false
+if go and threshold_mode == 1 and atr_m1 < MinATR_pct_price * close
+    go := false
+if go and threshold_mode == 0 and atr_points < MinATR_points
+    go := false
+float min_sl_points = threshold_mode == 1 ? MinSL_ATR * atr_points : MinSL_points
 
 // VolExpansionTriggerOK
 if go
@@ -626,14 +642,15 @@ if go and use_retest_entry and pending_retest
                     float sl_retest = pending_retest_level - retest_sl_ATR * atr_points * point_size
                     float sl_price = math.max(sl_struct, sl_retest)
                     float sl_points = (ask_px - sl_price) / point_size
-                    if sl_points < MinSL_points
-                        sl_points := MinSL_points
+                    if sl_points < min_sl_points
+                        sl_points := min_sl_points
                         sl_price := ask_px - sl_points * point_size
                     float lots = f_calc_lots(sl_points, risk_pct)
                     if lots > 0
                         float tp_price = ask_px + TP_R * sl_points * point_size
                         pos_sl := sl_price
                         pos_tp := tp_price
+                        pos_init_risk := na
                         strategy.entry("L", strategy.long, qty = lots * units_per_lot, comment = "L retest")
                         strategy.exit("X", "L", stop = sl_price, limit = tp_price, comment_loss = "SL", comment_profit = "TP")
                         trades_today += 1
@@ -652,14 +669,15 @@ if go and use_retest_entry and pending_retest
                     float sl_retest = pending_retest_level + retest_sl_ATR * atr_points * point_size
                     float sl_price = math.min(sl_struct, sl_retest)
                     float sl_points = (sl_price - bid_px) / point_size
-                    if sl_points < MinSL_points
-                        sl_points := MinSL_points
+                    if sl_points < min_sl_points
+                        sl_points := min_sl_points
                         sl_price := bid_px + sl_points * point_size
                     float lots = f_calc_lots(sl_points, risk_pct)
                     if lots > 0
                         float tp_price = bid_px - TP_R * sl_points * point_size
                         pos_sl := sl_price
                         pos_tp := tp_price
+                        pos_init_risk := na
                         strategy.entry("S", strategy.short, qty = lots * units_per_lot, comment = "S retest")
                         strategy.exit("X", "S", stop = sl_price, limit = tp_price, comment_loss = "SL", comment_profit = "TP")
                         trades_today += 1
@@ -681,13 +699,14 @@ if go and allow_buy and bias_up and bid_px > HH15 and close_pos >= active_close_
     else if mtf_ok_buy
         float sl_price = LL15 - buffer_points * point_size
         float sl_points = (ask_px - sl_price) / point_size
-        if sl_points < MinSL_points
-            sl_points := MinSL_points
+        if sl_points < min_sl_points
+            sl_points := min_sl_points
         float lots = f_calc_lots(sl_points, risk_pct)
         if lots > 0
             float tp_price = ask_px + TP_R * sl_points * point_size
             pos_sl := sl_price
             pos_tp := tp_price
+            pos_init_risk := na
             strategy.entry("L", strategy.long, qty = lots * units_per_lot, comment = "L breakout")
             strategy.exit("X", "L", stop = sl_price, limit = tp_price, comment_loss = "SL", comment_profit = "TP")
             trades_today += 1
@@ -707,13 +726,14 @@ if go and allow_sell and bias_dn and ask_px < LL15 and close_pos <= (1.0 - activ
     else if mtf_ok_sell
         float sl_price = HH15 + buffer_points * point_size
         float sl_points = (sl_price - bid_px) / point_size
-        if sl_points < MinSL_points
-            sl_points := MinSL_points
+        if sl_points < min_sl_points
+            sl_points := min_sl_points
         float lots = f_calc_lots(sl_points, risk_pct)
         if lots > 0
             float tp_price = bid_px - TP_R * sl_points * point_size
             pos_sl := sl_price
             pos_tp := tp_price
+            pos_init_risk := na
             strategy.entry("S", strategy.short, qty = lots * units_per_lot, comment = "S breakout")
             strategy.exit("X", "S", stop = sl_price, limit = tp_price, comment_loss = "SL", comment_profit = "TP")
             trades_today += 1

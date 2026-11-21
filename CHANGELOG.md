@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.02: execution fixes and volatility-relative options
+
+Bug fixes (always on):
+
+- **Trailing after break-even.** R was measured from the current stop, so once break-even moved the stop past the entry, R became negative and the ATR trailing never ran. R is now measured from the original stop of the opening order (read from history, cached per ticket). Mirrored in the Pine port.
+- **Magic-aware positions.** Position management, the equity hard stop and the "already in a position" check used `PositionSelect(_Symbol)`, which ignores the magic number. They now select only this EA's position (symbol + magic) and act by ticket, so other robots on the same symbol and hedging accounts are not touched.
+- **Foreign deals in the daily limit.** `OnTradeTransaction` counted stop-loss deals of any symbol and magic toward the daily loss limit and cooldown. It now counts only this EA's deals.
+- **Restart-safe daily state.** Trade count, daily loss in R and the last stop-loss time are rebuilt from deal history in `OnInit`, so a terminal restart no longer resets the daily limits.
+- **Lot sizing.** Loss per lot now comes from `OrderCalcProfit`, with tick value as fallback. Volume is still rounded down and the trade is skipped when even the minimum lot would exceed the risk budget.
+
+New options (off by default, so 1.01 behavior is unchanged):
+
+- `threshold_mode = 1` replaces `MinATR_points`, `MinSL_points` and `SpreadMax_points` with `MinATR_pct_price`, `MinSL_ATR` and `SpreadMax_ATR`, which scale with price and volatility. Mirrored in the Pine port, except the spread cap.
+- `signal_on_closed_bar = true` evaluates the impulse bar, ATR, ADX and range expansion on the last closed M1 bar, once per bar. This removes the dependence on where a tick lands inside the forming bar and makes the EA match the Pine port's evaluation model.
+
+Research note: a fixed-parameter comparison of both threshold modes on TradingView showed that the ATR floor is not what makes the strategy rare. No performance figures are published.
+
 ## 1.01: volatility gates read the current ATR
 
 - Fixed `GetVolRatio` and `ATRAccelerationOK`: the 200-value ATR window was copied into a non-series array, so `buf[0]` was the **oldest** value of the window instead of the current one. The M5 volatility regime and the M1 ATR-acceleration trigger were therefore comparing ATR from about 200 bars ago with the window average. Both arrays are now set as series.

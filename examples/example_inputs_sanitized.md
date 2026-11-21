@@ -21,6 +21,12 @@ trade_weekday_mask = empty or fictitious weekdays
 use_equity_risk_guard = false
 use_equity_dd_hard_stop = false
 use_macro_regime_filter = false
+
+threshold_mode = 0            (1 = ATR/price-relative thresholds)
+MinATR_pct_price = example value only
+MinSL_ATR = example value only
+SpreadMax_ATR = example value only
+signal_on_closed_bar = false  (true = closed-bar signals, closest match to the Pine port)
 ```
 
 Do not infer private or production presets from this file. Real presets are intentionally excluded from the public repository.

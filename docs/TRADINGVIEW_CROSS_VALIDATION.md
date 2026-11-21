@@ -62,7 +62,7 @@ The same strategy can be driven programmatically through TradingView's MCP tools
 
 ## Version Alignment
 
-The port matches EA version **1.01** and later. EA 1.00 read the oldest value of the 200-bar ATR window as the "current" ATR in its volatility regime and ATR-acceleration gates (see `CHANGELOG.md`). Do not cross-validate the port against Strategy Tester runs made with 1.00: the gates differ by construction.
+The port matches EA version **1.02**, including `threshold_mode` and the trailing fix. For the closest match with the EA, run the EA with `signal_on_closed_bar = true`: the Pine port always evaluates closed bars, so both engines then see the same signal bars and differ only in fills and data. The port matches EA version **1.01** and later on the ATR gates. EA 1.00 read the oldest value of the 200-bar ATR window as the "current" ATR in its volatility regime and ATR-acceleration gates (see `CHANGELOG.md`). Do not cross-validate the port against Strategy Tester runs made with 1.00: the gates differ by construction.
 
 ## Known Divergences
 
@@ -115,7 +115,7 @@ Compare distributions, not profit figures.
 
 These are qualitative notes from compiling and sanity-running the port on OANDA 1-minute gold history. They are not performance claims and no figures are published.
 
-- **Point-based thresholds do not scale with price.** `MinATR_points`, `MinSL_points`, `SpreadMax_points` and `break_even_lock_points` are absolute dollar distances. Gold's price level changed materially between 2024 and 2026, so a 1-minute ATR floor that is permissive at one price level is restrictive at another. In the sanity runs the port produced no trades for months at the lower price level and started trading as price and volatility rose; lowering the ATR floor for that period made trades appear. Anyone re-validating the EA across years should consider expressing these floors as a fraction of price or of a longer ATR.
+- **Point-based thresholds do not scale with price.** `MinATR_points`, `MinSL_points`, `SpreadMax_points` and `break_even_lock_points` are absolute dollar distances. Gold's price level changed materially between 2024 and 2026, so a 1-minute ATR floor that is permissive at one price level is restrictive at another. EA 1.02 adds `threshold_mode = 1`, which expresses them as a fraction of price or of the M1 ATR. A follow-up comparison with fixed parameters showed that, with the public defaults, the ATR floor is **not** the gate that makes the strategy rare: both threshold modes take almost the same trades. The scarcity comes from the stack of other gates. Volatility-relative thresholds remain the sounder design for multi-year work, but they do not by themselves change what the strategy does on this data, so the default stays at the legacy mode.
 - **The strategy is highly selective.** With the public defaults it trades far less often than `max_trades_day` suggests. Statistics from a few dozen trades are fragile; see [Validation Limits](VALIDATION_LIMITS.md).
 - **The evaluation model matters.** Enabling intrabar simulation changed the number of trades noticeably. Results that only hold under one evaluation model should not be trusted.
 - **Lot normalization bites small accounts.** With structural stops of tens of dollars and a fixed-fraction risk below 1 %, the computed size on a 10 000 unit account rounds to the minimum lot or to zero. The port reproduces this; account size is part of the strategy's behavior, not just a scaling factor.
