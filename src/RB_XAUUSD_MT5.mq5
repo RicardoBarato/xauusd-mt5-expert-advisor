@@ -5,7 +5,7 @@
 //|  Review, test and compile locally in MetaEditor before any use.   |
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.00"
+#property version "1.01"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -406,6 +406,7 @@ bool GetVolRatio(double &ratio)
    int need=MathMax(ATR_vol_sma_len,2);
    double buf[];
    ArrayResize(buf,need);
+   ArraySetAsSeries(buf,true);   // buf[0] = current bar (without this, buf[0] is the oldest copied value)
    if(CopyBuffer(atr_vol_handle,0,0,need,buf)!=need) return false;
    double atr_now=buf[0];
    double sum=0.0;
@@ -845,6 +846,7 @@ bool ATRAccelerationOK()
    int need=MathMax(atr_accel_sma_len,2);
    double buf[];
    ArrayResize(buf,need);
+   ArraySetAsSeries(buf,true);   // buf[0] = current bar (without this, buf[0] is the oldest copied value)
    if(CopyBuffer(atr_m1_handle,0,0,need,buf)!=need) return false;
    double atr_now=buf[0];
    double sum=0.0;

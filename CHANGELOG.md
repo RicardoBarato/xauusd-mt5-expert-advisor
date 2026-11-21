@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.01: volatility gates read the current ATR
+
+- Fixed `GetVolRatio` and `ATRAccelerationOK`: the 200-value ATR window was copied into a non-series array, so `buf[0]` was the **oldest** value of the window instead of the current one. The M5 volatility regime and the M1 ATR-acceleration trigger were therefore comparing ATR from about 200 bars ago with the window average. Both arrays are now set as series.
+- This changes which trades the EA takes. Any backtest or preset produced with 1.00 is not comparable with 1.01 and must be re-run.
+- The Pine Script port already used the current ATR and now matches the EA on this point; a comment marks the alignment.
+
 ## TradingView cross-validation port
 
 - Added `pine/RB_XAUUSD_MT5.pine`, a Pine Script v6 strategy that reproduces the Expert Advisor rules for TradingView so the strategy can be backtested on a second engine and data feed.

@@ -60,6 +60,10 @@ The same strategy can be driven programmatically through TradingView's MCP tools
 | `SYMBOL_TRADE_STOPS_LEVEL` check | Broker minimum stop distance | Not applicable | Removed. |
 | Symbol guard `InpAllowedSymbol` | `_Symbol` | User attaches to the right chart | Removed. |
 
+## Version Alignment
+
+The port matches EA version **1.01** and later. EA 1.00 read the oldest value of the 200-bar ATR window as the "current" ATR in its volatility regime and ATR-acceleration gates (see `CHANGELOG.md`). Do not cross-validate the port against Strategy Tester runs made with 1.00: the gates differ by construction.
+
 ## Known Divergences
 
 These are structural and cannot be removed by changing inputs. Read them before interpreting any difference between the two engines.

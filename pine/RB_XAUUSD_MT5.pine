@@ -276,6 +276,8 @@ float bid_px = close
 
 // M1 (chart) indicators
 float atr_m1 = f_mt5_atr(ATR_period)
+// Current ATR vs its average: matches EA 1.01+, where GetVolRatio/ATRAccelerationOK read the
+// current bar (ArraySetAsSeries). EA 1.00 read the oldest value of the window instead.
 float atr_m1_avg = ta.sma(atr_m1, atr_accel_sma_len)
 float adx_m1 = f_mt5_adx(ADX_period)
 
