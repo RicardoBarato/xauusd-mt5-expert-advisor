@@ -22,6 +22,7 @@ Any serious evaluation should include:
 - spread and slippage stress;
 - commission and swap assumptions;
 - broker-feed comparison;
+- cross-engine comparison (MetaTrader 5 Strategy Tester against the TradingView port, see `TRADINGVIEW_CROSS_VALIDATION.md`);
 - demo forward testing.
 
 ## What This Does Not Prove

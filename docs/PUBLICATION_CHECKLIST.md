@@ -16,6 +16,9 @@ Before publishing or updating this repository, verify:
 - [ ] No public performance tables.
 - [ ] No historical return, profit factor, drawdown or trade-count promotion.
 - [ ] No buy-and-hold comparison table.
+- [ ] No TradingView strategy reports, tester screenshots, exported trade lists or saved-script identifiers.
+- [ ] Pine port compiles without errors (TradingView editor or `validate_pine_script`) when it was changed.
+- [ ] Pine port still mirrors the MQL5 rules after any change to either file.
 - [ ] README contains no profit guarantee.
 - [ ] Disclaimer and risk disclosure are clear.
 - [ ] License is GPL-3.0-only.

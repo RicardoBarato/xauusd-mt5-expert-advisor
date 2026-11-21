@@ -70,6 +70,7 @@ Backtests are research tools, not guarantees. Historical behavior can fail in li
 
 - GPL-3.0 source code;
 - MQL5 Expert Advisor;
+- Pine Script v6 port of the same rules for TradingView cross-validation;
 - risk-control logic;
 - methodology notes;
 - architecture overview;
@@ -109,6 +110,17 @@ The included source and documentation are not a production preset. Any serious u
 5. Test in Strategy Tester and demo.
 6. Perform independent validation before making any operational decision.
 
+## Cross-Validation On TradingView
+
+The repository ships a Pine Script v6 port of the Expert Advisor (`pine/RB_XAUUSD_MT5.pine`) so the same rules can be backtested on a second engine and a second data feed. Input names match the MQL5 source; MetaTrader-specific indicator formulas (SMA-based ATR, EMA-smoothed ADX) are reproduced rather than replaced by Pine built-ins.
+
+1. Paste the script into a new Pine Script in TradingView.
+2. Attach it to a 1-minute XAUUSD chart (for example `OANDA:XAUUSD`).
+3. Use Deep Backtesting to cover more than the visible history.
+4. Compare trade count, direction mix and holding time with your Strategy Tester run, not profit figures.
+
+Tick-based evaluation in MetaTrader versus bar-close evaluation in Pine, the absence of a spread series on TradingView and forming versus completed higher-timeframe bars are structural differences. They are documented in [TradingView Cross-Validation](docs/TRADINGVIEW_CROSS_VALIDATION.md); read it before interpreting any difference between the two engines. No TradingView performance figures are published, under the same boundary that applies to MetaTrader reports.
+
 ## Repository Structure
 
 ```text
@@ -121,6 +133,9 @@ The included source and documentation are not a production preset. Any serious u
 |-- CHANGELOG.md
 |-- src/
 |   `-- RB_XAUUSD_MT5.mq5
+|-- pine/
+|   |-- README.md
+|   `-- RB_XAUUSD_MT5.pine
 |-- docs/
 |   |-- ARCHITECTURE.md
 |   |-- BACKTEST_RESEARCH_SUMMARY.md
@@ -128,6 +143,7 @@ The included source and documentation are not a production preset. Any serious u
 |   |-- PUBLICATION_CHECKLIST.md
 |   |-- RESEARCH_SNAPSHOT.md
 |   |-- RISK_DISCLOSURE.md
+|   |-- TRADINGVIEW_CROSS_VALIDATION.md
 |   `-- VALIDATION_LIMITS.md
 `-- examples/
     `-- example_inputs_sanitized.md
@@ -142,6 +158,7 @@ The included source and documentation are not a production preset. Any serious u
 - [Risk Disclosure](docs/RISK_DISCLOSURE.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Validation Limits](docs/VALIDATION_LIMITS.md)
+- [TradingView Cross-Validation](docs/TRADINGVIEW_CROSS_VALIDATION.md)
 - [Publication Checklist](docs/PUBLICATION_CHECKLIST.md)
 - [Sanitized example inputs](examples/example_inputs_sanitized.md)
 

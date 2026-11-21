@@ -11,6 +11,8 @@ Validation is a process, not a single backtest.
 - Gold/XAUUSD can gap or reprice abruptly.
 - Parameter choices can be overfit.
 - Low trade count can make results statistically fragile.
+- Thresholds expressed in points (`MinATR_points`, `MinSL_points`, `SpreadMax_points`) are absolute dollar distances and do not scale with gold's price level, so a parameter set validated at one price level behaves differently at another.
+- Results that depend on the evaluation model (every tick versus bar close) are evidence of execution sensitivity, not of an edge.
 
 ## Recommended Additional Tests
 
@@ -19,6 +21,7 @@ Validation is a process, not a single backtest.
 - Monte Carlo reshuffling and bootstrapping.
 - Spread and slippage stress.
 - Different brokers or data feeds.
+- A second backtest engine (the Pine Script port on TradingView), comparing trade distributions rather than profit.
 - Demo forward testing.
 - Failure-mode review for losing years and drawdown clusters.
 

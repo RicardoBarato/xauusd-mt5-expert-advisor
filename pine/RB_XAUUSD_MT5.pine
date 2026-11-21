@@ -1,0 +1,723 @@
+//@version=6
+// +------------------------------------------------------------------+
+// | RB_XAUUSD_MT5.pine                                               |
+// | Pine Script v6 port of src/RB_XAUUSD_MT5.mq5 for TradingView      |
+// | cross-validation of the MetaTrader 5 Expert Advisor.             |
+// |                                                                  |
+// | GPL-3.0-only. Research use only. Not financial advice.           |
+// | Run on a 1-minute XAUUSD chart. See docs/TRADINGVIEW_CROSS_VALIDATION.md |
+// | for the mapping between MQL5 and Pine and the known divergences. |
+// +------------------------------------------------------------------+
+strategy("RB XAUUSD MT5 port (research)", shorttitle = "RB_XAUUSD_port", overlay = true,
+     initial_capital = 10000, currency = currency.USD,
+     default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0,
+     process_orders_on_close = true, calc_on_every_tick = false,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.0,
+     slippage = 0)
+
+// ==================== PLATFORM EMULATION ====================
+G_PLAT = "Platform emulation (TradingView vs MT5)"
+tz                    = input.string("Europe/Athens", "Server timezone (MT5 broker time)", group = G_PLAT, tooltip = "Session hours, weekday masks and the daily reset use this timezone. Most MT5 brokers run EET/EEST (Europe/Athens).")
+point_size            = input.float(0.01, "point_size (MT5 _Point)", step = 0.001, minval = 0.0001, group = G_PLAT, tooltip = "All *_points inputs are multiplied by this value. XAUUSD with 2 digits = 0.01, with 3 digits = 0.001.")
+units_per_lot         = input.float(100, "units_per_lot", minval = 1, group = G_PLAT, tooltip = "Contract size: 1.00 MT5 lot of XAUUSD = 100 oz. The strategy orders qty = lots * units_per_lot.")
+lot_min               = input.float(0.01, "lot_min (SYMBOL_VOLUME_MIN)", step = 0.01, group = G_PLAT)
+lot_step              = input.float(0.01, "lot_step (SYMBOL_VOLUME_STEP)", step = 0.01, group = G_PLAT)
+lot_max               = input.float(100, "lot_max (SYMBOL_VOLUME_MAX)", group = G_PLAT)
+assumed_spread_points = input.int(25, "assumed_spread_points (ask = close + spread)", minval = 0, group = G_PLAT, tooltip = "TradingView has a single price series. The port models ask = close + spread for the SL/TP geometry of the EA. Use the strategy Slippage property to also charge the spread on fills.")
+
+// ==================== SAFETY / MODE ====================
+G_MODE = "Mode"
+InpMode = input.int(1, "InpMode (0 = selective | 1 = robust)", minval = 0, maxval = 1, group = G_MODE)
+
+// ==================== INPUTS (same names as the MQL5 source) ====================
+G_SESS = "Session and daily limits"
+session_reset_hour          = input.int(20, "session_reset_hour", minval = 0, maxval = 23, group = G_SESS)
+cooldown_minutes_after_sl   = input.int(15, "cooldown_minutes_after_sl", minval = 0, group = G_SESS)
+risk_base_pct               = input.float(0.007, "risk_base_pct", step = 0.001, group = G_SESS)
+max_daily_loss_R            = input.float(3.0, "max_daily_loss_R", step = 0.5, group = G_SESS)
+max_trades_day              = input.int(6, "max_trades_day", minval = 1, group = G_SESS)
+use_session_filter          = input.bool(true, "use_session_filter", group = G_SESS)
+session1_start_hour         = input.int(8, "session1_start_hour", minval = 0, maxval = 23, group = G_SESS)
+session1_end_hour           = input.int(11, "session1_end_hour", minval = 0, maxval = 23, group = G_SESS)
+session2_start_hour         = input.int(13, "session2_start_hour", minval = 0, maxval = 23, group = G_SESS)
+session2_end_hour           = input.int(16, "session2_end_hour", minval = 0, maxval = 23, group = G_SESS)
+trade_hour_mask             = input.string("", "trade_hour_mask (e.g. 8,9,10,13,14)", group = G_SESS)
+trade_weekday_mask          = input.string("", "trade_weekday_mask (1=Mon .. 5=Fri)", group = G_SESS)
+weekday_risk_multipliers    = input.string("", "weekday_risk_multipliers (e.g. 1:1.0,2:0.8)", group = G_SESS)
+hour_risk_multipliers       = input.string("", "hour_risk_multipliers (e.g. 8:1.0,13:0.8)", group = G_SESS)
+min_quality_for_trade       = input.float(0.05, "min_quality_for_trade", step = 0.01, group = G_SESS)
+weak_quality_threshold      = input.float(0.35, "weak_quality_threshold", step = 0.01, group = G_SESS)
+weak_quality_adx_bonus      = input.float(5.0, "weak_quality_adx_bonus", step = 0.5, group = G_SESS)
+weak_quality_impulse_bonus  = input.float(0.30, "weak_quality_impulse_bonus", step = 0.05, group = G_SESS)
+weak_quality_close_pos_bonus = input.float(0.04, "weak_quality_close_pos_bonus", step = 0.01, group = G_SESS)
+avoid_first_minutes_of_hour = input.int(2, "avoid_first_minutes_of_hour", minval = 0, maxval = 59, group = G_SESS)
+allow_buy                   = input.bool(true, "allow_buy", group = G_SESS)
+allow_sell                  = input.bool(true, "allow_sell", group = G_SESS)
+
+G_BASE = "Base signal"
+ATR_period            = input.int(14, "ATR_period (M1)", minval = 1, group = G_BASE)
+ADX_period            = input.int(14, "ADX_period (M1)", minval = 1, group = G_BASE)
+ADX_min               = input.float(25.0, "ADX_min", step = 0.5, group = G_BASE)
+MinATR_points         = input.int(120, "MinATR_points", minval = 0, group = G_BASE)
+TF_bias               = input.timeframe("60", "TF_bias", group = G_BASE)
+EMA_bias_fast         = input.int(50, "EMA_bias_fast", minval = 1, group = G_BASE)
+EMA_bias_slow         = input.int(200, "EMA_bias_slow", minval = 1, group = G_BASE)
+TF_structure          = input.timeframe("15", "TF_structure", group = G_BASE)
+structure_lookback    = input.int(14, "structure_lookback", minval = 1, group = G_BASE)
+impulse_mult          = input.float(2.2, "impulse_mult", step = 0.1, group = G_BASE)
+close_pos_min         = input.float(0.70, "close_pos_min", step = 0.01, group = G_BASE)
+structural_buffer_ATR = input.float(0.25, "structural_buffer_ATR", step = 0.05, group = G_BASE)
+MinSL_points          = input.int(80, "MinSL_points", minval = 1, group = G_BASE)
+TP_R                  = input.float(2.0, "TP_R", step = 0.1, group = G_BASE)
+
+G_REG = "Volatility regime (M5) and risk scaler"
+use_vol_regime   = input.bool(true, "use_vol_regime", group = G_REG)
+TF_vol           = input.timeframe("5", "TF_vol", group = G_REG)
+ATR_vol_period   = input.int(14, "ATR_vol_period", minval = 1, group = G_REG)
+ATR_vol_sma_len  = input.int(200, "ATR_vol_sma_len", minval = 2, group = G_REG)
+atr_exp_mult     = input.float(1.00, "atr_exp_mult", step = 0.05, group = G_REG)
+use_risk_scaler  = input.bool(true, "use_risk_scaler", group = G_REG)
+risk_min_pct     = input.float(0.004, "risk_min_pct", step = 0.001, group = G_REG)
+risk_max_pct     = input.float(0.010, "risk_max_pct", step = 0.001, group = G_REG)
+risk_scaler_k    = input.float(0.8, "risk_scaler_k", step = 0.1, group = G_REG)
+
+G_SQ = "Squeeze (M5) and cycle filter"
+use_squeeze_filter          = input.bool(true, "use_squeeze_filter", group = G_SQ)
+TF_squeeze                  = input.timeframe("5", "TF_squeeze", group = G_SQ)
+bb_period                   = input.int(20, "bb_period", minval = 1, group = G_SQ)
+bb_dev                      = input.float(2.0, "bb_dev", step = 0.1, group = G_SQ)
+kc_ema_period               = input.int(20, "kc_ema_period", minval = 1, group = G_SQ)
+kc_atr_period               = input.int(20, "kc_atr_period", minval = 1, group = G_SQ)
+kc_mult                     = input.float(1.30, "kc_mult", step = 0.05, group = G_SQ)
+squeeze_release_window_bars = input.int(10, "squeeze_release_window_bars", minval = 0, group = G_SQ)
+use_cycle_filter            = input.bool(true, "use_cycle_filter", group = G_SQ)
+cycle_lookback_bars         = input.int(36, "cycle_lookback_bars", minval = 1, group = G_SQ)
+allow_no_squeeze_selective  = input.bool(false, "allow_no_squeeze_selective", group = G_SQ)
+allow_no_squeeze_robust     = input.bool(true, "allow_no_squeeze_robust", group = G_SQ)
+
+G_TRIG = "Volatility expansion trigger (M1) and ADX M15 gate"
+use_atr_accel          = input.bool(true, "use_atr_accel", group = G_TRIG)
+atr_accel_sma_len      = input.int(200, "atr_accel_sma_len", minval = 2, group = G_TRIG)
+exp_ratio_min          = input.float(1.15, "exp_ratio_min", step = 0.05, group = G_TRIG)
+use_range_expansion    = input.bool(true, "use_range_expansion", group = G_TRIG)
+range_exp_mult         = input.float(2.4, "range_exp_mult", step = 0.1, group = G_TRIG)
+use_adx_m15_gate       = input.bool(true, "use_adx_m15_gate", group = G_TRIG)
+ADX_M15_period         = input.int(14, "ADX_M15_period", minval = 1, group = G_TRIG)
+ADX_M15_min_selective  = input.float(18.0, "ADX_M15_min_selective", step = 0.5, group = G_TRIG)
+ADX_M15_min_robust     = input.float(16.0, "ADX_M15_min_robust", step = 0.5, group = G_TRIG)
+
+G_QS = "Quality stack (MTF EMA confirm)"
+use_mtf_ema_confirm = input.bool(false, "use_mtf_ema_confirm", group = G_QS)
+TF_confirm_fast     = input.timeframe("5", "TF_confirm_fast", group = G_QS)
+TF_confirm_mid      = input.timeframe("15", "TF_confirm_mid", group = G_QS)
+EMA_confirm_fast    = input.int(21, "EMA_confirm_fast", minval = 1, group = G_QS)
+EMA_confirm_slow    = input.int(55, "EMA_confirm_slow", minval = 1, group = G_QS)
+
+G_BR = "Breakout / retest"
+use_breakout_extension_guard      = input.bool(false, "use_breakout_extension_guard", group = G_BR)
+max_breakout_extension_ATR        = input.float(0.85, "max_breakout_extension_ATR", step = 0.05, group = G_BR)
+use_retest_entry                  = input.bool(false, "use_retest_entry", group = G_BR)
+allow_direct_breakout_when_retest = input.bool(true, "allow_direct_breakout_when_retest", group = G_BR)
+retest_window_bars                = input.int(8, "retest_window_bars", minval = 1, group = G_BR)
+retest_zone_ATR                   = input.float(0.45, "retest_zone_ATR", step = 0.05, group = G_BR)
+retest_invalidation_ATR           = input.float(1.20, "retest_invalidation_ATR", step = 0.05, group = G_BR)
+retest_sl_ATR                     = input.float(1.10, "retest_sl_ATR", step = 0.05, group = G_BR)
+retest_resume_close_pos_min       = input.float(0.58, "retest_resume_close_pos_min", step = 0.01, group = G_BR)
+
+G_PM = "Position management"
+use_break_even         = input.bool(false, "use_break_even", group = G_PM)
+break_even_trigger_R   = input.float(1.00, "break_even_trigger_R", step = 0.05, group = G_PM)
+break_even_lock_points = input.int(5, "break_even_lock_points", minval = 0, group = G_PM)
+use_atr_trailing       = input.bool(false, "use_atr_trailing", group = G_PM)
+trail_start_R          = input.float(1.40, "trail_start_R", step = 0.05, group = G_PM)
+trail_atr_mult         = input.float(1.00, "trail_atr_mult", step = 0.05, group = G_PM)
+
+G_EQ = "Equity guards"
+use_equity_risk_guard                  = input.bool(false, "use_equity_risk_guard", group = G_EQ)
+equity_dd_cutoff_pct                   = input.float(0.18, "equity_dd_cutoff_pct", step = 0.01, group = G_EQ)
+equity_dd_risk_mult                    = input.float(0.65, "equity_dd_risk_mult", step = 0.05, group = G_EQ)
+use_equity_dd_hard_stop                = input.bool(false, "use_equity_dd_hard_stop", group = G_EQ)
+equity_dd_hard_stop_pct                = input.float(0.25, "equity_dd_hard_stop_pct", step = 0.01, group = G_EQ)
+equity_dd_hard_stop_block_new_entries  = input.bool(false, "equity_dd_hard_stop_block_new_entries", group = G_EQ)
+equity_dd_hard_stop_lock_forever       = input.bool(false, "equity_dd_hard_stop_lock_forever", group = G_EQ)
+
+G_MAC = "Macro regime filter"
+use_macro_regime_filter        = input.bool(false, "use_macro_regime_filter", group = G_MAC)
+TF_macro                       = input.timeframe("D", "TF_macro", group = G_MAC)
+EMA_macro_fast                 = input.int(50, "EMA_macro_fast", minval = 1, group = G_MAC)
+EMA_macro_slow                 = input.int(200, "EMA_macro_slow", minval = 1, group = G_MAC)
+macro_use_closed_bar           = input.bool(true, "macro_use_closed_bar", group = G_MAC)
+macro_require_fast_above_slow  = input.bool(true, "macro_require_fast_above_slow", group = G_MAC)
+macro_require_price_above_fast = input.bool(false, "macro_require_price_above_fast", group = G_MAC)
+macro_slope_bars               = input.int(5, "macro_slope_bars", minval = 0, group = G_MAC)
+macro_min_slope_ATR            = input.float(0.0, "macro_min_slope_ATR", step = 0.05, group = G_MAC)
+
+// ==================== CHART GUARD ====================
+if barstate.isfirst and timeframe.in_seconds() != 60
+    runtime.error("RB_XAUUSD_MT5 port: attach this strategy to a 1-minute chart (the EA runs its signal logic on M1).")
+
+// ==================== MT5-COMPATIBLE INDICATOR FORMULAS ====================
+// MetaTrader 5 iATR = simple moving average of the true range (not Wilder RMA).
+f_mt5_atr(int len) =>
+    ta.sma(ta.tr(true), len)
+
+// MetaTrader 5 iADX (ADX.mq5): per-bar +DI/-DI ratios smoothed with EMA, DX smoothed with EMA.
+f_mt5_adx(int len) =>
+    float p = math.max(high - high[1], 0.0)
+    float n = math.max(low[1] - low, 0.0)
+    if p > n
+        n := 0.0
+    else if p < n
+        p := 0.0
+    else
+        p := 0.0
+        n := 0.0
+    float tr = ta.tr(true)
+    float pd = tr != 0 ? 100.0 * p / tr : 0.0
+    float nd = tr != 0 ? 100.0 * n / tr : 0.0
+    float pdi = ta.ema(pd, len)
+    float ndi = ta.ema(nd, len)
+    float s = pdi + ndi
+    float dx = s != 0 ? 100.0 * math.abs(pdi - ndi) / s : 0.0
+    ta.ema(dx, len)
+
+// EMA value of the forming higher-timeframe bar, rebuilt from the last completed HTF EMA and the current price.
+// This is exactly what CopyBuffer(handle, 0, 0, 1, ...) returns in the EA for an EMA.
+f_ema_forming(float ema_prev_completed, int len) =>
+    float a = 2.0 / (len + 1)
+    a * close + (1.0 - a) * ema_prev_completed
+
+// Last completed-bar Bollinger / Keltner components on the squeeze timeframe.
+f_squeeze_prev() =>
+    float basis = ta.sma(close, bb_period)
+    float dev = bb_dev * ta.stdev(close, bb_period)
+    float up = basis + dev
+    float dn = basis - dev
+    float kc_mid = ta.ema(close, kc_ema_period)
+    float kc_atr = f_mt5_atr(kc_atr_period)
+    [up[1], dn[1], kc_mid[1], kc_atr[1]]
+
+// ==================== STRING HELPERS (MaskAllowsInt / LookupMultiplier) ====================
+f_mask_allows(string mask_value, int value) =>
+    string m = str.trim(mask_value)
+    bool result = true
+    if str.length(m) > 0
+        result := false
+        string[] parts = str.split(m, ",")
+        for i = 0 to array.size(parts) - 1
+            string item = str.trim(array.get(parts, i))
+            if str.length(item) > 0
+                float n = str.tonumber(item)
+                int allowed = na(n) ? 0 : int(n)
+                if allowed == value
+                    result := true
+    result
+
+f_lookup_multiplier(string map_value, int key, float fallback) =>
+    string m = str.trim(map_value)
+    float result = fallback
+    if str.length(m) > 0
+        bool found = false
+        string[] parts = str.split(m, ",")
+        for i = 0 to array.size(parts) - 1
+            string item = str.trim(array.get(parts, i))
+            if str.length(item) > 0 and not found
+                int colon = str.pos(item, ":")
+                if not na(colon) and colon > 0
+                    float k = str.tonumber(str.trim(str.substring(item, 0, colon)))
+                    float v = str.tonumber(str.trim(str.substring(item, colon + 1)))
+                    int key_int = na(k) ? 0 : int(k)
+                    if key_int == key
+                        result := na(v) ? 0.0 : v
+                        found := true
+    result
+
+f_in_window(int h, int start_h, int end_exclusive) =>
+    bool r = false
+    if start_h < end_exclusive
+        r := h >= start_h and h < end_exclusive
+    else if start_h > end_exclusive
+        r := h >= start_h or h < end_exclusive
+    r
+
+// ==================== LOT SIZING (GetValuePerPoint / NormalizeLots / CalcLots) ====================
+f_normalize_lots(float lots) =>
+    float out = 0.0
+    if lot_step > 0
+        out := math.floor(lots / lot_step) * lot_step
+        if out < lot_min
+            out := 0.0
+        if out > lot_max
+            out := lot_max
+    out
+
+f_calc_lots(float sl_points, float risk_pct) =>
+    float lots = 0.0
+    if sl_points > 0
+        float equity = strategy.equity
+        float risk_money = equity * risk_pct
+        float value_per_point = point_size * syminfo.pointvalue * units_per_lot
+        if value_per_point > 0
+            lots := f_normalize_lots(risk_money / (sl_points * value_per_point))
+    lots
+
+// ==================== TIME HELPERS ====================
+f_session_day_key(int t) =>
+    int shifted = t - session_reset_hour * 3600 * 1000
+    year(shifted, tz) * 10000 + month(shifted, tz) * 100 + dayofmonth(shifted, tz)
+
+int tm_hour = hour(time, tz)
+int tm_min = minute(time, tz)
+int tm_dow = dayofweek(time, tz) - 1   // MT5 day_of_week: 0 = Sunday ... 6 = Saturday
+
+// ==================== SERIES (computed every bar, as Pine requires) ====================
+float ask_px = close + assumed_spread_points * point_size
+float bid_px = close
+
+// M1 (chart) indicators
+float atr_m1 = f_mt5_atr(ATR_period)
+float atr_m1_avg = ta.sma(atr_m1, atr_accel_sma_len)
+float adx_m1 = f_mt5_adx(ADX_period)
+
+// H1 bias EMAs, forming-bar values
+float ema_bias_fast_prev = request.security(syminfo.tickerid, TF_bias, ta.ema(close, EMA_bias_fast)[1], lookahead = barmerge.lookahead_on)
+float ema_bias_slow_prev = request.security(syminfo.tickerid, TF_bias, ta.ema(close, EMA_bias_slow)[1], lookahead = barmerge.lookahead_on)
+float ema_bias_fast = f_ema_forming(ema_bias_fast_prev, EMA_bias_fast)
+float ema_bias_slow = f_ema_forming(ema_bias_slow_prev, EMA_bias_slow)
+
+// M15 structure levels over the last `structure_lookback` completed bars (iHighest/iLowest with shift 1)
+float HH15 = request.security(syminfo.tickerid, TF_structure, ta.highest(high, structure_lookback)[1], lookahead = barmerge.lookahead_on)
+float LL15 = request.security(syminfo.tickerid, TF_structure, ta.lowest(low, structure_lookback)[1], lookahead = barmerge.lookahead_on)
+
+// M5 volatility regime (last completed M5 bar)
+float atr_vol_now = request.security(syminfo.tickerid, TF_vol, f_mt5_atr(ATR_vol_period)[1], lookahead = barmerge.lookahead_on)
+float atr_vol_avg = request.security(syminfo.tickerid, TF_vol, ta.sma(f_mt5_atr(ATR_vol_period), ATR_vol_sma_len)[1], lookahead = barmerge.lookahead_on)
+
+// M5 squeeze components (last completed M5 bar)
+[bb_up, bb_dn, kc_mid, kc_atr] = request.security(syminfo.tickerid, TF_squeeze, f_squeeze_prev(), lookahead = barmerge.lookahead_on)
+float kc_upper = kc_mid + kc_mult * kc_atr
+float kc_lower = kc_mid - kc_mult * kc_atr
+bool squeeze_on_now = use_squeeze_filter and bb_up < kc_upper and bb_dn > kc_lower
+int squeeze_tf_time = time(TF_squeeze)
+
+// ADX M15 gate (last completed M15 bar). The EA hardcodes PERIOD_M15 here.
+float adx_m15 = request.security(syminfo.tickerid, "15", f_mt5_adx(ADX_M15_period)[1], lookahead = barmerge.lookahead_on)
+
+// MTF EMA confirmation, forming-bar values
+float ema_c_f1_prev = request.security(syminfo.tickerid, TF_confirm_fast, ta.ema(close, EMA_confirm_fast)[1], lookahead = barmerge.lookahead_on)
+float ema_c_s1_prev = request.security(syminfo.tickerid, TF_confirm_fast, ta.ema(close, EMA_confirm_slow)[1], lookahead = barmerge.lookahead_on)
+float ema_c_f2_prev = request.security(syminfo.tickerid, TF_confirm_mid, ta.ema(close, EMA_confirm_fast)[1], lookahead = barmerge.lookahead_on)
+float ema_c_s2_prev = request.security(syminfo.tickerid, TF_confirm_mid, ta.ema(close, EMA_confirm_slow)[1], lookahead = barmerge.lookahead_on)
+float ema_c_f1 = f_ema_forming(ema_c_f1_prev, EMA_confirm_fast)
+float ema_c_s1 = f_ema_forming(ema_c_s1_prev, EMA_confirm_slow)
+float ema_c_f2 = f_ema_forming(ema_c_f2_prev, EMA_confirm_fast)
+float ema_c_s2 = f_ema_forming(ema_c_s2_prev, EMA_confirm_slow)
+
+// Macro regime (D1)
+int macro_shift = macro_use_closed_bar ? 1 : 0
+int macro_slope = math.max(macro_slope_bars, 0)
+float macro_fast_prev = request.security(syminfo.tickerid, TF_macro, ta.ema(close, EMA_macro_fast)[1], lookahead = barmerge.lookahead_on)
+float macro_slow_prev = request.security(syminfo.tickerid, TF_macro, ta.ema(close, EMA_macro_slow)[1], lookahead = barmerge.lookahead_on)
+float macro_fast_old = request.security(syminfo.tickerid, TF_macro, ta.ema(close, EMA_macro_fast)[math.max(macro_shift + macro_slope, 1)], lookahead = barmerge.lookahead_on)
+float macro_close_prev = request.security(syminfo.tickerid, TF_macro, close[1], lookahead = barmerge.lookahead_on)
+float macro_atr_prev = request.security(syminfo.tickerid, TF_macro, f_mt5_atr(14)[1], lookahead = barmerge.lookahead_on)
+float macro_fast_now = macro_shift == 1 ? macro_fast_prev : f_ema_forming(macro_fast_prev, EMA_macro_fast)
+float macro_slow_now = macro_shift == 1 ? macro_slow_prev : f_ema_forming(macro_slow_prev, EMA_macro_slow)
+float macro_close = macro_shift == 1 ? macro_close_prev : close
+
+// ==================== STATE ====================
+var float daily_loss_R = 0.0
+var int trades_today = 0
+var bool locked_today = false
+var int session_day_key = -1
+var int last_sl_time = 0
+
+var bool squeeze_prev_on = false
+var int squeeze_release_countdown = 0
+var int last_squeeze_bar_time = 0
+var bool squeeze_seen_recent = false
+var int bars_since_squeeze = 1000000
+
+var float equity_peak = na
+var bool equity_dd_hard_stop_locked = false
+
+var bool pending_retest = false
+var bool pending_retest_buy = true
+var int pending_retest_expire = 0
+var float pending_retest_level = 0.0
+var float pending_retest_sl_ref = 0.0
+var float pending_retest_atr_points = 0.0
+
+var float pos_sl = na
+var float pos_tp = na
+var int closed_seen = 0
+
+// ==================== OnTradeTransaction: stop-loss accounting ====================
+if strategy.closedtrades > closed_seen
+    for i = closed_seen to strategy.closedtrades - 1
+        if strategy.closedtrades.exit_comment(i) == "SL" and strategy.closedtrades.profit(i) < 0
+            daily_loss_R -= 1.0
+            last_sl_time := strategy.closedtrades.exit_time(i)
+            if daily_loss_R <= -max_daily_loss_R
+                locked_today := true
+    closed_seen := strategy.closedtrades
+
+// ==================== ResetDailyIfNeeded ====================
+int day_key = f_session_day_key(time)
+if day_key != session_day_key
+    session_day_key := day_key
+    daily_loss_R := 0.0
+    trades_today := 0
+    locked_today := false
+    last_sl_time := 0
+    squeeze_prev_on := false
+    squeeze_release_countdown := 0
+    last_squeeze_bar_time := 0
+    squeeze_seen_recent := false
+
+// ==================== Equity drawdown ====================
+float equity_now = strategy.equity
+if na(equity_peak) or equity_now > equity_peak
+    equity_peak := equity_now
+float dd_pct = equity_peak > 0 ? (equity_peak - equity_now) / equity_peak : 0.0
+
+bool in_position = strategy.position_size != 0
+bool go = true
+
+// HandleEquityDdHardStop
+if use_equity_dd_hard_stop
+    if equity_dd_hard_stop_locked
+        go := false
+    else if dd_pct >= equity_dd_hard_stop_pct
+        if in_position
+            strategy.close_all(comment = "DD_HARD_STOP")
+        if in_position or equity_dd_hard_stop_block_new_entries or equity_dd_hard_stop_lock_forever
+            locked_today := true
+        if equity_dd_hard_stop_lock_forever
+            equity_dd_hard_stop_locked := true
+        if in_position or equity_dd_hard_stop_block_new_entries or equity_dd_hard_stop_lock_forever
+            go := false
+
+// ==================== ManageOpenPosition ====================
+if go and in_position
+    go := false
+    if (use_break_even or use_atr_trailing) and not na(pos_sl) and pos_sl > 0
+        bool is_buy = strategy.position_size > 0
+        float open_price = strategy.position_avg_price
+        float price = is_buy ? bid_px : ask_px
+        float risk_points = (is_buy ? (open_price - pos_sl) : (pos_sl - open_price)) / point_size
+        float profit_points = (is_buy ? (price - open_price) : (open_price - price)) / point_size
+        if risk_points > 0 and profit_points > 0
+            float new_sl = pos_sl
+            if use_break_even and profit_points >= break_even_trigger_R * risk_points
+                float be = is_buy ? open_price + break_even_lock_points * point_size : open_price - break_even_lock_points * point_size
+                if is_buy and be > new_sl
+                    new_sl := be
+                if not is_buy and be < new_sl
+                    new_sl := be
+            if use_atr_trailing and profit_points >= trail_start_R * risk_points
+                float trail = is_buy ? price - trail_atr_mult * atr_m1 : price + trail_atr_mult * atr_m1
+                if is_buy and trail > new_sl
+                    new_sl := trail
+                if not is_buy and trail < new_sl
+                    new_sl := trail
+            if math.abs(new_sl - pos_sl) >= point_size
+                pos_sl := new_sl
+                strategy.exit("X", is_buy ? "L" : "S", stop = pos_sl, limit = pos_tp, comment_loss = "SL", comment_profit = "TP")
+
+// ==================== Entry pipeline (same order as OnTick) ====================
+if go and last_sl_time > 0 and (time - last_sl_time) < cooldown_minutes_after_sl * 60 * 1000
+    go := false
+
+// SessionOK
+if go and use_session_filter
+    if not f_mask_allows(trade_weekday_mask, tm_dow)
+        go := false
+    else if avoid_first_minutes_of_hour > 0 and tm_min < avoid_first_minutes_of_hour
+        go := false
+    else
+        string hm = str.trim(trade_hour_mask)
+        if str.length(hm) > 0
+            go := f_mask_allows(hm, tm_hour)
+        else
+            go := f_in_window(tm_hour, session1_start_hour, session1_end_hour) or f_in_window(tm_hour, session2_start_hour, session2_end_hour)
+
+if go and locked_today
+    go := false
+if go and trades_today >= max_trades_day
+    go := false
+// SpreadOK: TradingView has no spread series; see assumed_spread_points and the docs.
+
+// GetVolRatio / VolatilityRegimeOK
+float vol_ratio = 1.0
+if go and (use_vol_regime or use_risk_scaler)
+    if na(atr_vol_now) or na(atr_vol_avg) or atr_vol_avg <= 0
+        go := false
+    else
+        vol_ratio := atr_vol_now / atr_vol_avg
+if go and use_vol_regime and vol_ratio < atr_exp_mult
+    go := false
+
+// Context quality
+float context_quality = 0.0
+if go
+    float wq = f_lookup_multiplier(weekday_risk_multipliers, tm_dow, 1.0)
+    float hq = f_lookup_multiplier(hour_risk_multipliers, tm_hour, 1.0)
+    context_quality := math.max(wq * hq, 0.0)
+    if context_quality < min_quality_for_trade
+        go := false
+
+// Risk pct: CalcRiskPct -> ApplyContextRisk -> ApplyEquityRiskGuard
+float risk_pct = 0.0
+if go
+    float r = risk_base_pct
+    if use_risk_scaler
+        r := risk_base_pct * (1.0 + risk_scaler_k * (vol_ratio - 1.0))
+        r := math.max(r, risk_min_pct)
+        r := math.min(r, risk_max_pct)
+    r := math.min(r * context_quality, risk_max_pct)
+    if use_equity_risk_guard and dd_pct >= equity_dd_cutoff_pct
+        r := r * equity_dd_risk_mult
+    risk_pct := r
+    if risk_pct <= 0
+        go := false
+
+float active_adx_min = ADX_min
+float active_impulse_mult = impulse_mult
+float active_close_pos_min = close_pos_min
+if go and context_quality <= weak_quality_threshold
+    active_adx_min += weak_quality_adx_bonus
+    active_impulse_mult += weak_quality_impulse_bonus
+    active_close_pos_min := math.min(active_close_pos_min + weak_quality_close_pos_bonus, 0.95)
+
+// SqueezeGateOK (state machine advances only when reached, exactly like the EA)
+if go and use_squeeze_filter
+    if na(bb_up) or na(bb_dn) or na(kc_mid) or na(kc_atr)
+        go := false
+    else
+        // UpdateCycleMemory
+        if use_cycle_filter
+            if last_squeeze_bar_time == 0
+                last_squeeze_bar_time := squeeze_tf_time
+            if squeeze_tf_time != last_squeeze_bar_time
+                last_squeeze_bar_time := squeeze_tf_time
+                if squeeze_on_now
+                    squeeze_seen_recent := true
+                    bars_since_squeeze := 0
+                else
+                    bars_since_squeeze += 1
+                if bars_since_squeeze > cycle_lookback_bars
+                    squeeze_seen_recent := false
+                if squeeze_release_countdown > 0
+                    squeeze_release_countdown -= 1
+        if squeeze_prev_on and not squeeze_on_now
+            squeeze_release_countdown := squeeze_release_window_bars
+        squeeze_prev_on := squeeze_on_now
+        if squeeze_on_now
+            go := false
+        else
+            bool in_release = squeeze_release_countdown > 0
+            bool allow_no_squeeze = InpMode == 0 ? allow_no_squeeze_selective : allow_no_squeeze_robust
+            if use_cycle_filter
+                go := (squeeze_seen_recent and in_release) or allow_no_squeeze
+            else
+                go := in_release or allow_no_squeeze
+
+// ADX_M15_OK
+if go and use_adx_m15_gate
+    float adx15_min = InpMode == 0 ? ADX_M15_min_selective : ADX_M15_min_robust
+    if na(adx_m15) or adx_m15 < adx15_min
+        go := false
+
+// Bias + macro regime
+bool bias_up = false
+bool bias_dn = false
+if go
+    bias_up := not na(ema_bias_fast) and not na(ema_bias_slow) and ema_bias_fast > ema_bias_slow
+    bias_dn := not na(ema_bias_fast) and not na(ema_bias_slow) and ema_bias_fast < ema_bias_slow
+    if use_macro_regime_filter
+        bool macro_ok_up = true
+        bool macro_ok_dn = true
+        if na(macro_fast_now) or na(macro_slow_now) or na(macro_fast_old) or na(macro_close) or macro_close <= 0
+            macro_ok_up := false
+            macro_ok_dn := false
+        else
+            if macro_require_fast_above_slow and macro_fast_now <= macro_slow_now
+                macro_ok_up := false
+            if macro_require_price_above_fast and macro_close <= macro_fast_now
+                macro_ok_up := false
+            if macro_require_fast_above_slow and macro_fast_now >= macro_slow_now
+                macro_ok_dn := false
+            if macro_require_price_above_fast and macro_close >= macro_fast_now
+                macro_ok_dn := false
+            if macro_min_slope_ATR > 0 and macro_slope > 0
+                if na(macro_atr_prev) or macro_atr_prev <= 0
+                    macro_ok_up := false
+                    macro_ok_dn := false
+                else
+                    if (macro_fast_now - macro_fast_old) < macro_min_slope_ATR * macro_atr_prev
+                        macro_ok_up := false
+                    if (macro_fast_old - macro_fast_now) < macro_min_slope_ATR * macro_atr_prev
+                        macro_ok_dn := false
+        bias_up := bias_up and macro_ok_up
+        bias_dn := bias_dn and macro_ok_dn
+    if not bias_up and not bias_dn
+        go := false
+
+// ATR M1 floor
+float atr_points = atr_m1 / point_size
+if go and (na(atr_m1) or atr_points < MinATR_points)
+    go := false
+
+// VolExpansionTriggerOK
+if go
+    bool a_ok = not na(atr_m1_avg) and atr_m1_avg > 0 and atr_m1 >= atr_m1_avg * exp_ratio_min
+    float range_points0 = (high - low) / point_size
+    bool b_ok = range_points0 >= range_exp_mult * atr_points
+    bool trig = true
+    if use_atr_accel and use_range_expansion
+        trig := a_ok or b_ok
+    else if use_atr_accel
+        trig := a_ok
+    else if use_range_expansion
+        trig := b_ok
+    if not trig
+        go := false
+
+// ADX M1
+if go and (na(adx_m1) or adx_m1 < active_adx_min)
+    go := false
+
+// Structure + impulse bar
+if go and (na(HH15) or na(LL15))
+    go := false
+
+float range_points = (high - low) / point_size
+if go and range_points < active_impulse_mult * atr_points
+    go := false
+
+float close_pos = high > low ? (close - low) / (high - low) : 0.5
+float buffer_points = structural_buffer_ATR * atr_points
+
+bool mtf_ok_buy = not use_mtf_ema_confirm or (ema_c_f1 > ema_c_s1 and ema_c_f2 > ema_c_s2)
+bool mtf_ok_sell = not use_mtf_ema_confirm or (ema_c_f1 < ema_c_s1 and ema_c_f2 < ema_c_s2)
+
+// ==================== TryRetestEntry ====================
+if go and use_retest_entry and pending_retest
+    if time > pending_retest_expire
+        pending_retest := false
+    else
+        float zone_points = retest_zone_ATR * atr_points
+        float invalid_points = retest_invalidation_ATR * atr_points
+        float resume_min = math.max(retest_resume_close_pos_min, active_close_pos_min - 0.10)
+        if pending_retest_buy
+            if bid_px < pending_retest_level - invalid_points * point_size
+                pending_retest := false
+            else
+                float extension_points = (bid_px - pending_retest_level) / point_size
+                bool touched = low <= pending_retest_level + zone_points * point_size
+                bool resumed = close > pending_retest_level and close_pos >= resume_min
+                bool not_extended = not use_breakout_extension_guard or extension_points <= max_breakout_extension_ATR * atr_points
+                if bias_up and touched and resumed and not_extended and mtf_ok_buy
+                    go := false
+                    float sl_struct = pending_retest_sl_ref - buffer_points * point_size
+                    float sl_retest = pending_retest_level - retest_sl_ATR * atr_points * point_size
+                    float sl_price = math.max(sl_struct, sl_retest)
+                    float sl_points = (ask_px - sl_price) / point_size
+                    if sl_points < MinSL_points
+                        sl_points := MinSL_points
+                        sl_price := ask_px - sl_points * point_size
+                    float lots = f_calc_lots(sl_points, risk_pct)
+                    if lots > 0
+                        float tp_price = ask_px + TP_R * sl_points * point_size
+                        pos_sl := sl_price
+                        pos_tp := tp_price
+                        strategy.entry("L", strategy.long, qty = lots * units_per_lot, comment = "L retest")
+                        strategy.exit("X", "L", stop = sl_price, limit = tp_price, comment_loss = "SL", comment_profit = "TP")
+                        trades_today += 1
+                        pending_retest := false
+        else
+            if ask_px > pending_retest_level + invalid_points * point_size
+                pending_retest := false
+            else
+                float extension_points = (pending_retest_level - ask_px) / point_size
+                bool touched = high >= pending_retest_level - zone_points * point_size
+                bool resumed = close < pending_retest_level and close_pos <= (1.0 - resume_min)
+                bool not_extended = not use_breakout_extension_guard or extension_points <= max_breakout_extension_ATR * atr_points
+                if bias_dn and touched and resumed and not_extended and mtf_ok_sell
+                    go := false
+                    float sl_struct = pending_retest_sl_ref + buffer_points * point_size
+                    float sl_retest = pending_retest_level + retest_sl_ATR * atr_points * point_size
+                    float sl_price = math.min(sl_struct, sl_retest)
+                    float sl_points = (sl_price - bid_px) / point_size
+                    if sl_points < MinSL_points
+                        sl_points := MinSL_points
+                        sl_price := bid_px + sl_points * point_size
+                    float lots = f_calc_lots(sl_points, risk_pct)
+                    if lots > 0
+                        float tp_price = bid_px - TP_R * sl_points * point_size
+                        pos_sl := sl_price
+                        pos_tp := tp_price
+                        strategy.entry("S", strategy.short, qty = lots * units_per_lot, comment = "S retest")
+                        strategy.exit("X", "S", stop = sl_price, limit = tp_price, comment_loss = "SL", comment_profit = "TP")
+                        trades_today += 1
+                        pending_retest := false
+
+// ==================== Direct breakout entries ====================
+if go and allow_buy and bias_up and bid_px > HH15 and close_pos >= active_close_pos_min
+    go := false
+    float extension_points = (bid_px - HH15) / point_size
+    bool arm_only = (use_retest_entry and not allow_direct_breakout_when_retest) or (use_breakout_extension_guard and extension_points > max_breakout_extension_ATR * atr_points)
+    if arm_only
+        if use_retest_entry
+            pending_retest := true
+            pending_retest_buy := true
+            pending_retest_level := HH15
+            pending_retest_sl_ref := LL15
+            pending_retest_atr_points := atr_points
+            pending_retest_expire := time + retest_window_bars * 60 * 1000
+    else if mtf_ok_buy
+        float sl_price = LL15 - buffer_points * point_size
+        float sl_points = (ask_px - sl_price) / point_size
+        if sl_points < MinSL_points
+            sl_points := MinSL_points
+        float lots = f_calc_lots(sl_points, risk_pct)
+        if lots > 0
+            float tp_price = ask_px + TP_R * sl_points * point_size
+            pos_sl := sl_price
+            pos_tp := tp_price
+            strategy.entry("L", strategy.long, qty = lots * units_per_lot, comment = "L breakout")
+            strategy.exit("X", "L", stop = sl_price, limit = tp_price, comment_loss = "SL", comment_profit = "TP")
+            trades_today += 1
+
+if go and allow_sell and bias_dn and ask_px < LL15 and close_pos <= (1.0 - active_close_pos_min)
+    go := false
+    float extension_points = (LL15 - ask_px) / point_size
+    bool arm_only = (use_retest_entry and not allow_direct_breakout_when_retest) or (use_breakout_extension_guard and extension_points > max_breakout_extension_ATR * atr_points)
+    if arm_only
+        if use_retest_entry
+            pending_retest := true
+            pending_retest_buy := false
+            pending_retest_level := LL15
+            pending_retest_sl_ref := HH15
+            pending_retest_atr_points := atr_points
+            pending_retest_expire := time + retest_window_bars * 60 * 1000
+    else if mtf_ok_sell
+        float sl_price = HH15 + buffer_points * point_size
+        float sl_points = (sl_price - bid_px) / point_size
+        if sl_points < MinSL_points
+            sl_points := MinSL_points
+        float lots = f_calc_lots(sl_points, risk_pct)
+        if lots > 0
+            float tp_price = bid_px - TP_R * sl_points * point_size
+            pos_sl := sl_price
+            pos_tp := tp_price
+            strategy.entry("S", strategy.short, qty = lots * units_per_lot, comment = "S breakout")
+            strategy.exit("X", "S", stop = sl_price, limit = tp_price, comment_loss = "SL", comment_profit = "TP")
+            trades_today += 1
+
+// ==================== PLOTS (review aids) ====================
+plot(HH15, "HH15 (M15 structure high)", color = color.new(color.teal, 0), style = plot.style_linebr)
+plot(LL15, "LL15 (M15 structure low)", color = color.new(color.maroon, 0), style = plot.style_linebr)
+plot(ema_bias_fast, "EMA bias fast (forming)", color = color.new(color.blue, 40))
+plot(ema_bias_slow, "EMA bias slow (forming)", color = color.new(color.orange, 40))
